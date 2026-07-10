@@ -92,6 +92,7 @@ export const PlayerController = {
   avplayEnded: false,
   avplayCurrentTimeMs: 0,
   avplayDurationMs: 0,
+  avplaySeekToken: 0,
   avplayTrackSyncAt: 0,
   lastPlaybackErrorCode: 0,
   currentPlaybackUrl: "",
@@ -2180,31 +2181,56 @@ export const PlayerController = {
     }
 
     const targetMs = Math.max(0, Math.floor(seconds * 1000));
+    const seekToken = Number(this.avplaySeekToken || 0) + 1;
+    this.avplaySeekToken = seekToken;
+    const isCurrentSeek = () => seekToken === this.avplaySeekToken && this.isUsingAvPlay();
+
+    // seekTo() is async: per Tizen's docs, other AVPlay calls (like setSpeed)
+    // aren't allowed until its success/error callback fires. A fixed timeout
+    // can race real (network-dependent) seek completion, so wait for the
+    // actual callback and only use the timeout as a fallback safety net.
+    let settled = false;
+    const settleSeek = () => {
+      if (settled || !isCurrentSeek()) {
+        return;
+      }
+      settled = true;
+      this.refreshAvPlayTimeline();
+      this.avplayReady = true;
+      this.reapplyAvPlayPlaybackRate();
+      this.emitVideoEvent("seeked", { playbackEngine: this.playbackEngine });
+      this.emitVideoEvent("canplay", { playbackEngine: this.playbackEngine });
+      // A single setSpeed() right after a seek isn't reliably honored by
+      // AVPlay's firmware, same as after play() (see startPreparedAvPlayPlayback);
+      // keep nudging it for a bit so the chosen speed actually sticks.
+      [250, 750, 1500].forEach((delayMs) => {
+        setTimeout(() => {
+          if (isCurrentSeek()) {
+            this.reapplyAvPlayPlaybackRate();
+          }
+        }, delayMs);
+      });
+    };
+
     try {
       this.avplayReady = false;
       this.emitVideoEvent("waiting", { playbackEngine: this.playbackEngine });
       this.emitVideoEvent("seeking", { playbackEngine: this.playbackEngine });
       if (typeof avplay.seekTo === "function") {
-        avplay.seekTo(targetMs);
+        avplay.seekTo(targetMs, settleSeek, settleSeek);
       } else {
         const currentMs = Number(avplay.getCurrentTime?.() || 0);
         if (targetMs > currentMs) {
-          avplay.jumpForward?.(targetMs - currentMs);
+          avplay.jumpForward?.(targetMs - currentMs, settleSeek, settleSeek);
         } else if (targetMs < currentMs) {
-          avplay.jumpBackward?.(currentMs - targetMs);
+          avplay.jumpBackward?.(currentMs - targetMs, settleSeek, settleSeek);
+        } else {
+          settleSeek();
         }
       }
       this.avplayCurrentTimeMs = targetMs;
       this.emitVideoEvent("timeupdate", { playbackEngine: this.playbackEngine });
-      setTimeout(() => {
-        if (!this.isUsingAvPlay()) {
-          return;
-        }
-        this.refreshAvPlayTimeline();
-        this.avplayReady = true;
-        this.emitVideoEvent("seeked", { playbackEngine: this.playbackEngine });
-        this.emitVideoEvent("canplay", { playbackEngine: this.playbackEngine });
-      }, 120);
+      setTimeout(settleSeek, 1500);
       return true;
     } catch (_) {
       return false;
@@ -3047,6 +3073,18 @@ export const PlayerController = {
     if (!isValidAvPlayPlaybackSpeedState(state)) {
       return false;
     }
+
+    if (state === "PAUSED") {
+      // AVPlay's setSpeed() does an internal seek (Samsung docs: "repeated
+      // seek"), which shifts position even while paused. Defer it; resume()
+      // reapplies the rate once playback actually starts.
+      logTizenAvPlayDebug("Tizen AVPlay setSpeed deferred while paused", {
+        speed: targetSpeed,
+        state
+      });
+      return true;
+    }
+
     try {
       avplay.setSpeed(targetSpeed);
       this.appliedAvPlayPlaybackRate = targetSpeed;
@@ -3082,6 +3120,18 @@ export const PlayerController = {
       return targetSpeed;
     }
     return Number(this.video?.playbackRate || 1);
+  },
+
+  // video.load() and some seeks reset playbackRate to 1x; reapply desired speed.
+  reapplyNativePlaybackRate() {
+    if (this.isUsingAvPlay() || !this.video) {
+      return false;
+    }
+    const targetSpeed = this.normalizePlaybackRate(this.desiredPlaybackRate);
+    if (!Number.isFinite(targetSpeed)) {
+      return false;
+    }
+    return this.setPlaybackRate(targetSpeed);
   },
 
   setPlaybackRate(speed = 1) {
@@ -3519,11 +3569,15 @@ export const PlayerController = {
 
     const syncNativeMediaId = () => {
       this.syncNativeMediaId();
+      this.reapplyNativePlaybackRate();
     };
     this.video.addEventListener("loadedmetadata", syncNativeMediaId);
     this.video.addEventListener("loadeddata", syncNativeMediaId);
     this.video.addEventListener("canplay", syncNativeMediaId);
     this.video.addEventListener("playing", syncNativeMediaId);
+    this.video.addEventListener("seeked", () => {
+      this.reapplyNativePlaybackRate();
+    });
     this.video.addEventListener("emptied", () => {
       this.resetNativeMediaState();
     });
@@ -3815,16 +3869,18 @@ export const PlayerController = {
         this.reapplyAvPlayPlaybackRate();
         this.startAvPlayTickTimer();
         this.emitVideoEvent("playing", { playbackEngine: this.playbackEngine });
-        setTimeout(() => {
-          this.reapplyAvPlayPlaybackRate();
-          this.applyPendingAvPlayAudioTrackSelection();
-          this.applyPendingAvPlaySubtitleTrackSelection();
-        }, 0);
-        setTimeout(() => {
-          this.reapplyAvPlayPlaybackRate();
-          this.applyPendingAvPlayAudioTrackSelection();
-          this.applyPendingAvPlaySubtitleTrackSelection();
-        }, 300);
+        // Match startPreparedAvPlayPlayback()'s retry schedule: AVPlay doesn't
+        // reliably honor setSpeed() right after resuming from pause.
+        [0, 250, 750, 1500].forEach((delayMs) => {
+          setTimeout(() => {
+            if (!this.isUsingAvPlay()) {
+              return;
+            }
+            this.reapplyAvPlayPlaybackRate();
+            this.applyPendingAvPlayAudioTrackSelection();
+            this.applyPendingAvPlaySubtitleTrackSelection();
+          }, delayMs);
+        });
       } catch (error) {
         this.lastPlaybackErrorCode = this.mapAvPlayErrorToMediaCode(error?.name || error?.message || error);
         console.warn("Playback resume rejected", error);
